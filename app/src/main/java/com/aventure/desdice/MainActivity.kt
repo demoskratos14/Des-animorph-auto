@@ -24,7 +24,11 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private val handler = Handler(Looper.getMainLooper())
-    private val serverUrl = "http://127.0.0.1:5001"
+    // Doit correspondre exactement a PORT dans android_bridge.py. Different
+    // de la version d'origine (5001) expres : 127.0.0.1 est partage par tout
+    // l'appareil Android, donc deux apps sur le meme port se genent l'une
+    // l'autre si elles tournent toutes les deux en arriere-plan en meme temps.
+    private val serverUrl = "http://127.0.0.1:5011"
     private var attempts = 0
     private val maxAttempts = 40 // ~20 secondes de tentatives au premier lancage
 

@@ -99,6 +99,14 @@ class DiceSession:
         #               tire au sort parmi enabled_symbols
         self.pip_mode = "single"
         self.enabled_symbols = list(PIP_SYMBOLS.keys())
+
+        # Totems/allies ajoutes par le joueur en cours de partie, en plus
+        # des symboles de base (PIP_SYMBOLS, fixes dans le code). Chaque
+        # entree : {"key", "label", "emoji", "image" (nom de fichier ou
+        # None), "powers" (liste de str), "special" (str, optionnelle)}.
+        # Voir all_symbols()/all_symbol_keys() pour la fusion avec les
+        # symboles de base, utilisee partout ailleurs dans le moteur.
+        self.custom_totems = []
         # Valeurs autorisees pour le de de reussite : par defaut les 6 sont
         # actives. On peut en decocher certaines (ex: ne garder que 1, 5 et
         # 6) pour representer un avantage/desavantage narratif ; le tirage
@@ -168,7 +176,8 @@ class DiceSession:
                  "next_quest_id": self.next_quest_id,
                  "story_log": self.story_log,
                  "mistral_api_key": self.mistral_api_key,
-                 "ai_conversation": self.ai_conversation}
+                 "ai_conversation": self.ai_conversation,
+                 "custom_totems": self.custom_totems}
         with open(SAVE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -181,9 +190,30 @@ class DiceSession:
             self.pip_symbol = data.get("pip_symbol", DEFAULT_PIP_SYMBOL)
             pip_mode = data.get("pip_mode", "single")
             self.pip_mode = pip_mode if pip_mode in ("single", "random", "mixed") else "single"
+
+            # Totems ajoutes par le joueur : charges AVANT enabled_symbols et
+            # totem_energy, car ces deux-la dependent de all_symbol_keys()
+            # (base + totems ajoutes) pour ne pas perdre ceux-ci au filtrage.
+            raw_custom = data.get("custom_totems") or []
+            self.custom_totems = []
+            for t in raw_custom:
+                if not isinstance(t, dict) or not t.get("key") or not t.get("label"):
+                    continue
+                if t["key"] in PIP_SYMBOLS:
+                    continue  # ne doit jamais ecraser un symbole de base
+                self.custom_totems.append({
+                    "key": t["key"],
+                    "label": str(t["label"]),
+                    "emoji": str(t.get("emoji") or ""),
+                    "image": t.get("image") if isinstance(t.get("image"), str) else None,
+                    "powers": [p for p in (t.get("powers") or []) if isinstance(p, str)],
+                    "special": str(t.get("special") or ""),
+                })
+            valid_keys = self.all_symbol_keys()
+
             enabled = data.get("enabled_symbols") or []
-            enabled = [k for k in enabled if k in PIP_SYMBOLS]
-            self.enabled_symbols = enabled or list(PIP_SYMBOLS.keys())
+            enabled = [k for k in enabled if k in valid_keys]
+            self.enabled_symbols = enabled or list(valid_keys)
             min_value = data.get("allowed_success_values")
             allowed = [v for v in (min_value or []) if v in (1, 2, 3, 4, 5, 6)]
             self.allowed_success_values = sorted(set(allowed)) or [1, 2, 3, 4, 5, 6]
@@ -193,7 +223,7 @@ class DiceSession:
             self.allowed_fate_keys = allowed_fate or [f["key"] for f in FATE_FACES]
 
             energy = data.get("totem_energy") or {}
-            self.totem_energy = {k: int(energy.get(k, 0)) for k in PIP_SYMBOLS}
+            self.totem_energy = {k: int(energy.get(k, 0)) for k in valid_keys}
 
             try:
                 self.threat_level = max(0, int(data.get("threat_level", 0)))
@@ -218,7 +248,7 @@ class DiceSession:
         return False
 
     def set_pip_symbol(self, key):
-        if key in PIP_SYMBOLS:
+        if key in self.all_symbol_keys():
             self.pip_symbol = key
             self.pip_mode = "single"
             self.save()
@@ -236,20 +266,98 @@ class DiceSession:
             self.pip_mode = "single"
         else:
             self.pip_mode = mode
-            self.enabled_symbols = list(PIP_SYMBOLS.keys())
+            self.enabled_symbols = list(self.all_symbol_keys())
         self.save()
         return True
 
     def toggle_enabled_symbol(self, key):
         """Coche/decoche un symbole dans le pool utilise par les modes
         aleatoire/mixe. On garde toujours au moins un symbole actif."""
-        if key not in PIP_SYMBOLS:
+        if key not in self.all_symbol_keys():
             return False
         if key in self.enabled_symbols:
             if len(self.enabled_symbols) > 1:
                 self.enabled_symbols.remove(key)
         else:
             self.enabled_symbols.append(key)
+        self.save()
+        return True
+
+    # ---------- totems ajoutes par le joueur ----------
+    def all_symbol_keys(self):
+        """Ensemble de toutes les cles de symboles valides : celles de
+        base (PIP_SYMBOLS) + celles des totems ajoutes par le joueur."""
+        return set(PIP_SYMBOLS.keys()) | {t["key"] for t in self.custom_totems}
+
+    def all_symbols(self):
+        """Fusionne les symboles de base et les totems ajoutes par le
+        joueur en un seul dict {cle: {emoji, label, powers, special,
+        image, is_custom}}, utilise partout ou l'appli doit afficher ou
+        proposer TOUS les symboles disponibles (choix du pip, jauges
+        totemiques, contexte envoye a l'IA...)."""
+        merged = {}
+        for k, v in PIP_SYMBOLS.items():
+            merged[k] = {"emoji": v["emoji"], "label": v["label"], "image": None,
+                         "powers": [], "special": "", "is_custom": False}
+        for t in self.custom_totems:
+            merged[t["key"]] = {
+                "emoji": t.get("emoji") or "\U0001F43E",
+                "label": t["label"],
+                "image": t.get("image"),
+                "powers": t.get("powers") or [],
+                "special": t.get("special") or "",
+                "is_custom": True,
+            }
+        return merged
+
+    def _slugify_totem_key(self, label):
+        base = "".join(c.lower() if c.isalnum() else "_" for c in label).strip("_")
+        while "__" in base:
+            base = base.replace("__", "_")
+        base = base or "totem"
+        key = base
+        existing = self.all_symbol_keys()
+        n = 2
+        while key in existing:
+            key = f"{base}_{n}"
+            n += 1
+        return key
+
+    def add_custom_totem(self, label, powers_text="", special="", emoji="", image_filename=None):
+        """Ajoute un nouveau totem/allie en cours de partie : nouvelle
+        entree dans le selecteur de symboles, nouvelle jauge d'energie
+        (a 0), active par defaut. Renvoie la cle attribuee, ou None si le
+        nom est vide."""
+        label = (label or "").strip()
+        if not label:
+            return None
+        key = self._slugify_totem_key(label)
+        powers = [p.strip() for p in (powers_text or "").split(",") if p.strip()]
+        self.custom_totems.append({
+            "key": key,
+            "label": label,
+            "emoji": (emoji or "").strip(),
+            "image": image_filename,
+            "powers": powers,
+            "special": (special or "").strip(),
+        })
+        if key not in self.enabled_symbols:
+            self.enabled_symbols.append(key)
+        self.totem_energy[key] = 0
+        self.save()
+        return key
+
+    def remove_custom_totem(self, key):
+        """Retire un totem ajoute par le joueur (jauge et image comprises
+        -- le fichier image lui-meme doit etre supprime cote appelant).
+        Sans effet sur les symboles de base (PIP_SYMBOLS)."""
+        before = len(self.custom_totems)
+        self.custom_totems = [t for t in self.custom_totems if t["key"] != key]
+        if len(self.custom_totems) == before:
+            return False
+        if key in self.enabled_symbols and len(self.enabled_symbols) > 1:
+            self.enabled_symbols.remove(key)
+        self.totem_energy.pop(key, None)
         self.save()
         return True
 
@@ -311,7 +419,7 @@ class DiceSession:
         """Consomme la jauge d'un totem/allie si elle est pleine. Renvoie
         True si elle a bien ete depensee (et donc que l'effet peut etre
         declenche cote appelant), False si elle n'etait pas encore prete."""
-        if key not in PIP_SYMBOLS or not self.is_totem_ready(key):
+        if key not in self.all_symbol_keys() or not self.is_totem_ready(key):
             return False
         self.totem_energy[key] = 0
         self.save()
@@ -417,7 +525,7 @@ class DiceSession:
         """Determine le symbole utilise pour chaque pip d'une face, selon
         le mode courant. Le nombre de pips est toujours egal a la valeur
         (1 a 6)."""
-        pool = self.enabled_symbols or list(PIP_SYMBOLS.keys())
+        pool = self.enabled_symbols or list(self.all_symbol_keys())
         if self.pip_mode == "random":
             symbol = random.choice(pool)
             return [symbol] * value

@@ -67,6 +67,59 @@ Détails techniques utiles à savoir :
   appel (l'historique complet, lui, reste affiché et sauvegardé dans
   l'appli).
 - Un bouton "Retirer la clé" repasse en mode manuel à tout moment.
+- **Démarrer l'aventure sans attendre un lancer** : la carte "Continuer
+  l'aventure ailleurs" devient "Démarrer ou relancer un chapitre" avec un
+  bouton "Envoyer le prompt à l'IA" — il transmet mécaniques + histoire déjà
+  vécue (s'il y en a) et demande explicitement au modèle de commencer le
+  prochain chapitre. Pratique pour planter le décor avant le tout premier
+  lancer, ou pour relancer le fil après un "Réinitialiser la conversation IA".
+- **Message libre à l'IA** : un champ de texte dans la carte "Narration
+  automatique" permet d'envoyer n'importe quel message au narrateur à tout
+  moment (décrire une action de Gabin entre deux lancers, préciser un
+  détail...), pas seulement les résultats de dés.
+- **Univers Marvel** : le contexte envoyé à l'IA précise que l'aventure se
+  déroule dans l'univers Marvel — le narrateur peut y faire intervenir
+  d'autres personnages Marvel au fil de l'histoire (nouvelles rencontres,
+  alliances ponctuelles), en plus des trois alliés déjà liés à un symbole
+  (Araignée=Spider-Man, Bouclier=Captain America, Étoile=Shuri).
+- **Les 6 totems animaux sont acquis dès le début** (Aigle, Loup, Renard,
+  Jaguar, Grand Bond, Profondeurs) — ce ne sont pas des découvertes à venir,
+  Gabin les a déjà tous au départ.
+- **De nouveaux totems peuvent apparaître au fil de l'aventure**, et le jeu a
+  déjà tout ce qu'il faut pour ça : quand un "❓" du dé du destin débloque une
+  quête secondaire de type "objet", c'est le signal envoyé à l'IA d'inventer
+  la rencontre d'un nouveau totem (nom, apparence, pouvoirs) et de la
+  raconter dans le chapitre. Une fois le chapitre terminé, **c'est toi qui
+  l'ajoutes dans l'application** via le formulaire de la carte "Jauges
+  totémiques" — nom, pouvoirs, capacité spéciale (optionnelle), et soit un
+  emoji tapé à la main, soit **une image que tu uploades toi-même** (stockée
+  en local dans un dossier `totem_images/` à côté de `dice_state.json`,
+  jamais envoyée ailleurs qu'au modèle sous forme de texte). Il obtient
+  aussitôt sa propre jauge, apparaît dans le sélecteur de symboles, et est
+  automatiquement inclus dans le contexte envoyé à l'IA à partir de ce
+  moment — sans réécrire les chapitres précédents où il n'existait pas
+  encore. La fréquence reste donc entièrement entre tes mains : l'IA
+  invente la rencontre dans l'histoire, mais seule ta validation manuelle
+  lui donne une existence mécanique (jauge, pouvoirs suivis par l'appli).
+  Un bouton permet de
+  retirer un totem ajouté par erreur (jauge et image supprimées avec).
+
+## Port réseau interne différent de l'original
+
+Chaque version de l'appli fait tourner un petit serveur local sur
+`127.0.0.1` pour s'afficher elle-même — c'est invisible pour toi, mais
+important à savoir : **`127.0.0.1` est partagé par tout le téléphone**, pas
+cloisonné par application comme le reste (stockage, mémoire...). Si deux
+applications différentes utilisent le même port et tournent toutes les deux
+en arrière-plan en même temps, la première à avoir démarré garde le port et
+la seconde reste bloquée — elle donne l'impression de ne plus s'ouvrir.
+
+Cette version "Auto" utilise donc le port **5011**, différent de celui de la
+version d'origine (**5001**), pour que les deux applications puissent
+cohabiter sur le même téléphone sans jamais se gêner, même laissées
+ouvertes toutes les deux en fond. Si tu crées encore d'autres variantes à
+l'avenir (voir `android_bridge.py` et `MainActivity.kt`, tous deux à
+modifier ensemble), pense à leur donner chacune un port différent.
 
 ## Nom de l'application et icône colorée
 

@@ -11,17 +11,34 @@ MainActivity.kt). Il :
      UNIQUEMENT si aucune sauvegarde n'existe encore, pour ne pas ecraser
      une aventure deja en cours.
   3. Importe dice_web (qui cree l'objet Flask "app") et le lance dans un
-     thread en arriere-plan, sur 127.0.0.1:5001.
+     thread en arriere-plan, sur 127.0.0.1:PORT (voir PORT ci-dessous).
 
 Le WebView de MainActivity charge ensuite directement cette adresse : tout
 se passe a l'interieur de l'application, sans jamais ouvrir de navigateur
 externe.
+
+IMPORTANT -- pourquoi PORT n'est PAS 5001 ici :
+127.0.0.1 (la boucle locale) est partage par TOUT l'appareil Android, pas
+cloisonne par application comme le reste (stockage, memoire...). Si deux
+applications differentes essaient chacune de se brancher sur le meme port
+pendant qu'elles tournent toutes les deux en arriere-plan, la premiere a
+avoir demarre garde le port et la seconde ne peut plus se connecter --
+elle reste bloquee, comme si elle ne s'ouvrait plus. Cette version "Auto"
+utilise donc un port different (5011) de celui de la version d'origine
+(5001), pour que les deux applications puissent tourner en meme temps
+sans jamais se gener, meme laissees ouvertes toutes les deux en fond.
 """
 
 import os
 import shutil
 import threading
 from os.path import dirname, join, exists
+
+# Port du serveur interne de CETTE version (Auto). Doit rester different
+# de celui de toute autre variante de l'appli installee en parallele sur
+# le meme telephone -- voir l'explication ci-dessus. Doit correspondre
+# exactement a la valeur de "serverUrl" dans MainActivity.kt.
+PORT = 5011
 
 _started = False
 _lock = threading.Lock()
@@ -48,7 +65,7 @@ def start_server():
         def _run():
             dice_web.app.run(
                 host="127.0.0.1",
-                port=5001,
+                port=PORT,
                 debug=False,
                 use_reloader=False,
                 threaded=True,

@@ -15,7 +15,9 @@ Lancement :
 
 import json
 import math
-from flask import Flask, request, redirect, url_for, render_template_string, jsonify
+import os
+import uuid
+from flask import Flask, request, redirect, url_for, render_template_string, jsonify, send_from_directory
 
 from dice_engine import (DiceSession, FATE_FACES, FATE_BY_KEY, SUCCESS_LABELS,
                           PIP_SYMBOLS, TOTEM_ENERGY_THRESHOLD, THREAT_THRESHOLD)
@@ -23,6 +25,15 @@ from bg_animorph_data import BG_IMAGE_B64
 import mistral_client
 
 app = Flask(__name__)
+# Limite la taille des requetes (en pratique : les images de totems
+# uploadees) a 5 Mo -- raisonnable sur mobile (stockage/memoire limites).
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+
+# Dossier ou sont sauvegardees les images de totems ajoutees par le joueur,
+# relatif au repertoire de travail (le meme que dice_state.json). Cree a la
+# demande, seulement quand une premiere image est effectivement envoyee.
+TOTEM_IMAGES_DIR = "totem_images"
+ALLOWED_TOTEM_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
 session = DiceSession()
 session.load()
 
@@ -341,13 +352,23 @@ def render_araignee_svg(cls):
 def render_pip_symbol(pip_symbol_key, badge=False):
     """Rendu d'un symbole de pip. Cas speciaux pour le bouclier et
     l'araignee : dessines en CSS/SVG (couleurs rouge/bleu) plutot qu'en
-    emoji (les emojis ne peuvent pas etre recolores)."""
+    emoji (les emojis ne peuvent pas etre recolores). Pour un totem
+    ajoute par le joueur avec sa propre image, affiche cette image ;
+    sinon utilise son emoji (ou celui de base pour les symboles fixes)."""
     if pip_symbol_key == "bouclier":
         cls = "pip-shield badge-size" if badge else "pip-shield"
         return render_bouclier_svg(cls)
     if pip_symbol_key == "araignee":
         cls = "pip-araignee badge-size" if badge else "pip-araignee"
         return render_araignee_svg(cls)
+    info = session.all_symbols().get(pip_symbol_key)
+    if info and info.get("image"):
+        size = "1.15rem" if badge else "1em"
+        return (f'<img src="{url_for("totem_image", filename=info["image"])}" '
+                f'alt="{info["label"]}" style="width:{size}; height:{size}; '
+                f'object-fit:contain; vertical-align:-0.15em;">')
+    if info:
+        return info["emoji"] or PIP_SYMBOLS["araignee"]["emoji"]
     return PIP_SYMBOLS.get(pip_symbol_key, PIP_SYMBOLS["araignee"])["emoji"]
 
 
@@ -696,6 +717,44 @@ def roll_animation_script():
           if (aiEl && typeof data.ai_story === 'string') {{ aiEl.outerHTML = data.ai_story; }}
         }});
     }}
+    function applyGaugeAndPicker(data){{
+      var gEl = document.getElementById('totemGauges');
+      if (gEl && data.gauges) {{ gEl.outerHTML = data.gauges; }}
+      var sEl = document.getElementById('symbolPicker');
+      if (sEl && data.symbol_picker) {{ sEl.outerHTML = data.symbol_picker; }}
+    }}
+    function addCustomTotem(){{
+      var nameEl = document.getElementById('totemNameInput');
+      var name = nameEl ? nameEl.value.trim() : '';
+      if (!name) {{ alert('Donne au moins un nom au totem.'); return; }}
+      var fd = new FormData();
+      fd.append('label', name);
+      fd.append('powers', document.getElementById('totemPowersInput').value);
+      fd.append('special', document.getElementById('totemSpecialInput').value);
+      fd.append('emoji', document.getElementById('totemEmojiInput').value);
+      var fileInput = document.getElementById('totemImageInput');
+      if (fileInput && fileInput.files.length > 0) {{ fd.append('image', fileInput.files[0]); }}
+      fetch('/add_custom_totem', {{ method: 'POST', body: fd }})
+        .then(function(r){{ return r.json(); }})
+        .then(function(data){{
+          applyGaugeAndPicker(data);
+          nameEl.value = '';
+          document.getElementById('totemPowersInput').value = '';
+          document.getElementById('totemSpecialInput').value = '';
+          document.getElementById('totemEmojiInput').value = '';
+          if (fileInput) {{ fileInput.value = ''; }}
+        }});
+    }}
+    function removeCustomTotem(key){{
+      if (!confirm("Retirer ce totem ? Sa jauge et son image sont supprimees definitivement.")) {{ return; }}
+      fetch('/remove_custom_totem', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+        body: new URLSearchParams({{key: key}}).toString()
+      }})
+        .then(function(r){{ return r.json(); }})
+        .then(function(data){{ applyGaugeAndPicker(data); }});
+    }}
     function completeSideQuest(questId){{
       fetch('/complete_side_quest', {{
         method: 'POST',
@@ -780,6 +839,18 @@ def roll_animation_script():
                    + "Le reste de la partie (des, jauges, quetes) n'est pas touche.")) {{ return; }}
       refreshAiPanel('/reset_ai_conversation');
     }}
+    function sendFullPromptToAi(){{
+      showAiWritingIndicator();
+      refreshAiPanel('/send_full_prompt');
+    }}
+    function sendAiMessage(){{
+      var el = document.getElementById('aiFreeMessageInput');
+      var text = el ? el.value.trim() : '';
+      if (!text) {{ return; }}
+      showAiWritingIndicator();
+      refreshAiPanel('/send_ai_message', {{text: text}});
+      if (el) {{ el.value = ''; }}
+    }}
     </script>
     """
 
@@ -810,8 +881,7 @@ def last_of(field):
 
 
 def render_symbol_picker_html():
-    def badge_html(key):
-        info = PIP_SYMBOLS[key]
+    def badge_html(key, info):
         if session.pip_mode == "single":
             cls = "symbol-active" if key == session.pip_symbol else ""
             onclick = f"pickSymbol('{key}')"
@@ -821,8 +891,12 @@ def render_symbol_picker_html():
         return (f'<div class="totem-badge {cls}" onclick="{onclick}" '
                 f'title="{info["label"]}">{render_pip_symbol(key, badge=True)}</div>')
 
-    symbol_keys = list(PIP_SYMBOLS.keys())
-    row1_keys, row2_keys = symbol_keys[:5], symbol_keys[5:]
+    all_syms = session.all_symbols()
+    # Symboles de base d'abord (ordre fixe habituel), puis les totems
+    # ajoutes par le joueur a la suite -- par rangees de 5, quel que soit
+    # le nombre total (le nombre de rangees s'adapte automatiquement).
+    symbol_keys = list(PIP_SYMBOLS.keys()) + [t["key"] for t in session.custom_totems]
+    rows_keys = [symbol_keys[i:i + 5] for i in range(0, len(symbol_keys), 5)]
 
     aleatoire_html = (
         f'<div class="totem-badge big{" mode-active" if session.pip_mode == "random" else ""}" '
@@ -833,15 +907,18 @@ def render_symbol_picker_html():
         f'onclick="pickMode(\'mixed\')" title="Melange de symboles sur la meme face">\U0001f500</div>'
     )
 
+    rows_html = "".join(
+        '<div class="totem-row" style="justify-content:center; margin:0;">'
+        + "".join(badge_html(k, all_syms[k]) for k in row) + "</div>"
+        for row in rows_keys
+    )
+
     return (
         '<div id="symbolPicker" style="display:flex; align-items:center; justify-content:center; '
         'gap:10px; flex-wrap:wrap; margin-top:26px;">'
         + aleatoire_html
         + '<div style="display:flex; flex-direction:column; gap:8px; align-items:center;">'
-        + '<div class="totem-row" style="justify-content:center; margin:0;">'
-        + "".join(badge_html(k) for k in row1_keys) + "</div>"
-        + '<div class="totem-row" style="justify-content:center; margin:0;">'
-        + "".join(badge_html(k) for k in row2_keys) + "</div>"
+        + rows_html
         + "</div>"
         + mixe_html
         + "</div>"
@@ -916,22 +993,35 @@ def render_allowed_fate_picker_html():
 
 
 def render_totem_gauges_html():
-    """Une barre de jauge par symbole/totem/allie. Un bouton 'Utiliser'
-    apparait des qu'une jauge est pleine (>=TOTEM_ENERGY_THRESHOLD)."""
+    """Une barre de jauge par symbole/totem/allie (base + totems ajoutes
+    par le joueur). Un bouton 'Utiliser' apparait des qu'une jauge est
+    pleine (>=TOTEM_ENERGY_THRESHOLD) ; un bouton de suppression apparait
+    uniquement sur les totems ajoutes par le joueur (jamais sur les
+    symboles de base)."""
     rows = []
-    for key, info in PIP_SYMBOLS.items():
+    for key, info in session.all_symbols().items():
         energy = session.totem_energy.get(key, 0)
         pct = min(100, round(100 * energy / TOTEM_ENERGY_THRESHOLD))
         ready = energy >= TOTEM_ENERGY_THRESHOLD
         btn = (f'<button type="button" class="small" onclick="useTotemEnergy(\'{key}\')">'
                f'&#10024; Utiliser</button>') if ready else ""
         bar_cls = "totem-gauge-fill ready" if ready else "totem-gauge-fill"
+        if info.get("image"):
+            icon_html = (f'<img src="{url_for("totem_image", filename=info["image"])}" '
+                         f'alt="{info["label"]}" style="width:1.4rem; height:1.4rem; '
+                         f'object-fit:contain; vertical-align:-0.25em;">')
+        else:
+            icon_html = info["emoji"]
+        remove_btn = (
+            f'<button type="button" class="small danger" onclick="removeCustomTotem(\'{key}\')" '
+            f'title="Retirer ce totem">&#128465;</button>'
+        ) if info.get("is_custom") else ""
         rows.append(
             '<div class="totem-gauge-row">'
-            f'<span class="totem-gauge-icon" title="{info["label"]}">{info["emoji"]}</span>'
+            f'<span class="totem-gauge-icon" title="{info["label"]}">{icon_html}</span>'
             f'<div class="totem-gauge-track"><div class="{bar_cls}" style="width:{pct}%"></div></div>'
             f'<span class="totem-gauge-val">{energy}/{TOTEM_ENERGY_THRESHOLD}</span>'
-            f'{btn}'
+            f'{btn}{remove_btn}'
             '</div>'
         )
     return f'<div id="totemGauges">{"".join(rows)}</div>'
@@ -1059,7 +1149,9 @@ def render_ai_panel_html(transient_error=None):
                 f'{msg["content"].replace(chr(10), "<br>")}</div>'
             )
     feed = "".join(rows) if rows else (
-        '<p class="sub">(l\'histoire commencera au prochain lancer)</p>'
+        '<p class="sub">(rien pour l\'instant -- lance un de, utilise le bouton '
+        '"Envoyer le prompt a l\'IA" plus bas, ou ecris un message ci-dessous '
+        'pour planter le decor et demarrer l\'aventure)</p>'
     )
     error_html = (
         f'<div class="sub" style="color:var(--red); margin-bottom:8px;">'
@@ -1072,6 +1164,11 @@ def render_ai_panel_html(transient_error=None):
         '&#9989; Narration automatique active (Mistral)</div>'
         + error_html
         + f'<div id="aiStoryFeed" style="max-height:340px; overflow-y:auto;">{feed}</div>'
+        + '<label style="margin-top:12px;">Message libre a l\'IA (demarrer l\'aventure, '
+        + 'decrire une action de Gabin...)</label>'
+        + '<textarea id="aiFreeMessageInput" placeholder="Ex: Commence l\'aventure : '
+        + 'Gabin explore une jungle mysterieuse au coucher du soleil..."></textarea>'
+        + '<button type="button" onclick="sendAiMessage()">&#9993;&#65039; Envoyer a l\'IA</button>'
         + '<div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">'
         + '<button type="button" class="small secondary" onclick="resetAiConversation()">'
         + '&#8635; Reinitialiser la conversation IA</button>'
@@ -1188,6 +1285,11 @@ def build_mechanics_context(auto_mode=False):
         powers, special = totems_compact[t["key"]]
         suffix = f" — spe: {special}" if special else ""
         lines.append(f"{t['icon']}{t['label']}: {', '.join(powers)}{suffix}")
+    for t in session.custom_totems:
+        icon = t.get("emoji") or "\U0001F43E"
+        powers_txt = ", ".join(t["powers"]) if t["powers"] else "(pouvoirs non precises)"
+        special_txt = f" — spe: {t['special']}" if t.get("special") else ""
+        lines.append(f"{icon}{t['label']} (ajoute par le joueur): {powers_txt}{special_txt}")
     lines.append(
         f"{PIP_SYMBOLS['araignee']['emoji']}Araignee=allie Spider-Man | "
         f"{PIP_SYMBOLS['bouclier']['emoji']}Bouclier=allie Captain America | "
@@ -1204,6 +1306,28 @@ def build_mechanics_context(auto_mode=False):
     lines.append(
         f"JAUGE DE MENACE : +3 sur un 1, -1 sur un 5 ou 6. A {THREAT_THRESHOLD} "
         "points, complication secondaire inattendue puis retombe a 0."
+    )
+    lines.append("")
+    lines.append(
+        "UNIVERS : l'aventure se deroule dans l'univers Marvel. Tu peux y faire "
+        "intervenir d'autres personnages Marvel au fil de l'histoire (nouvelles "
+        "rencontres, alliances ponctuelles), en plus des trois allies deja lies "
+        "a un symbole fixe (Araignee=Spider-Man, Bouclier=Captain America, "
+        "Etoile=Shuri). Tous les totems listes ci-dessus sont deja acquis par "
+        "Gabin des le debut de l'aventure (ce ne sont pas des decouvertes a "
+        "venir)."
+    )
+    lines.append(
+        "NOUVEAUX TOTEMS : quand une quete secondaire de type 'objet' est menee "
+        "a terme, c'est l'occasion ideale d'inventer la rencontre d'un nouveau "
+        "totem animal pour Gabin (nom, apparence, pouvoirs de ton invention) -- "
+        "raconte cette decouverte dans l'histoire. Le joueur l'ajoutera ensuite "
+        "lui-meme dans l'application une fois le chapitre termine (nouvelle "
+        "jauge, image...) : tu n'as donc rien a gerer mecaniquement pour lui, "
+        "juste a le raconter. S'il apparait plus tard dans la liste des "
+        "TOTEMS/ALLIES ci-dessus (le joueur l'aura alors ajoute), integre-le "
+        "naturellement a partir de ce moment-la, sans revenir sur les chapitres "
+        "precedents ou il n'existait pas encore."
     )
     lines.append("")
     if auto_mode:
@@ -1240,6 +1364,81 @@ def build_full_prompt():
     lines.append(story if story else "(aucun chapitre enregistre pour l'instant, on commence "
                                        "une aventure toute neuve)")
     return "\n".join(lines)
+
+
+def build_ai_kickoff_message():
+    """Message complet envoye a l'IA quand on clique sur "Envoyer le prompt
+    a l'IA" (mode automatique) : mecaniques (version narration auto) +
+    histoire deja vecue si des chapitres ont ete enregistres manuellement,
+    puis une instruction finale demandant explicitement de demarrer (ou
+    poursuivre) le prochain chapitre.
+
+    Sert a amorcer la conversation automatique sans attendre un premier
+    lancer -- utile en tout debut d'aventure, ou pour la relancer avec le
+    contexte complet apres un "Reinitialiser la conversation IA"."""
+    lines = [build_mechanics_context(auto_mode=True)]
+    story = session.story_log_text()
+    if story:
+        lines.append("")
+        lines.append("--- HISTOIRE DEJA VECUE ---")
+        lines.append(story)
+        lines.append("")
+        lines.append("Commence maintenant le prochain chapitre de l'histoire, "
+                      "dans la continuite directe de ce qui precede.")
+    else:
+        lines.append("")
+        lines.append("Aucun chapitre n'a encore ete joue. Commence maintenant le tout "
+                      "premier chapitre de cette aventure : plante le decor et presente "
+                      "la situation de depart de Gabin/Animorph, puis demande-moi le "
+                      "premier lancer des que la situation l'exige.")
+    return "\n".join(lines)
+
+
+def render_continue_card_html():
+    """Carte "Continuer l'aventure ailleurs" / "Demarrer ou relancer un
+    chapitre" : deux comportements distincts selon le mode.
+    - Sans cle Mistral (mode manuel) : bouton "copier le prompt complet"
+      inchange, a coller dans une IA externe.
+    - Avec une cle Mistral (mode automatique) : le meme bouton devient
+      "Envoyer le prompt a l'IA" -- il transmet directement les mecaniques
+      + l'histoire deja vecue a l'IA narratrice, avec une instruction de
+      demarrer le prochain chapitre. C'est le moyen d'amorcer l'aventure
+      avant le tout premier lancer (aucun lancer n'est necessaire pour que
+      l'IA ait de quoi commencer a raconter)."""
+    if session.has_mistral_key():
+        return f"""
+    <div class="card">
+      <h2 style="margin-top:0">Demarrer ou relancer un chapitre</h2>
+      <p class="sub" style="margin-bottom:8px;">
+        Envoie les mecaniques du jeu et l'histoire deja vecue directement a
+        l'IA, avec une instruction de demarrer le prochain chapitre -- utile
+        avant le tout premier lancer, ou pour relancer le fil de l'histoire
+        apres avoir reinitialise la conversation IA.
+      </p>
+      <button type="button" onclick="sendFullPromptToAi()">
+        &#128640; Envoyer le prompt a l'IA
+      </button>
+      <p class="sub" style="margin:10px 0 0 0; font-size:0.8rem;">
+        {len(session.story_log)} chapitre(s) enregistre(s) dans le journal.
+      </p>
+    </div>
+    """
+    return f"""
+    <div class="card">
+      <h2 style="margin-top:0">Continuer l'aventure ailleurs</h2>
+      <p class="sub" style="margin-bottom:8px;">
+        Un seul bouton pour tout transmettre (mecaniques + histoire deja vecue)
+        a une IA narratrice, ici ou ailleurs, sans tout re-expliquer.
+      </p>
+      <textarea id="fullPromptBox" style="position:absolute; left:-9999px; top:-9999px;"></textarea>
+      <button type="button" id="fullPromptBtn" onclick="copyFullPrompt()">
+        &#128203; Copier le prompt complet pour une IA
+      </button>
+      <p class="sub" style="margin:10px 0 0 0; font-size:0.8rem;">
+        {len(session.story_log)} chapitre(s) enregistre(s) dans le journal.
+      </p>
+    </div>
+    """
 
 
 def render_dice_result_html():
@@ -1328,6 +1527,17 @@ def index():
       <h2 style="margin-top:0">Jauges totemiques</h2>
       <p class="sub" style="margin-bottom:8px;">Chaque totem/allie a sa propre jauge. Pleine, elle devient utilisable.</p>
       {render_totem_gauges_html()}
+
+      <div style="margin-top:18px; padding-top:14px; border-top:2px dashed var(--line);">
+        <label>Ajouter un totem (rare, a utiliser quand l'histoire l'introduit)</label>
+        <input type="text" id="totemNameInput" placeholder="Nom (ex: Corbeau Ombreux)">
+        <input type="text" id="totemPowersInput" placeholder="Pouvoirs, separes par des virgules">
+        <input type="text" id="totemSpecialInput" placeholder="Capacite speciale (optionnel)">
+        <input type="text" id="totemEmojiInput" placeholder="Emoji (optionnel, ex: &#129415;)">
+        <label style="font-weight:400; opacity:0.8;">Ou une image a toi (optionnel, remplace l'emoji) :</label>
+        <input type="file" id="totemImageInput" accept="image/*">
+        <button type="button" onclick="addCustomTotem()">&#10133; Ajouter ce totem</button>
+      </div>
     </div>
 
     <div class="card">
@@ -1335,20 +1545,7 @@ def index():
       {render_side_quests_html()}
     </div>
 
-    <div class="card">
-      <h2 style="margin-top:0">Continuer l'aventure ailleurs</h2>
-      <p class="sub" style="margin-bottom:8px;">
-        Un seul bouton pour tout transmettre (mecaniques + histoire deja vecue)
-        a une IA narratrice, ici ou ailleurs, sans tout re-expliquer.
-      </p>
-      <textarea id="fullPromptBox" style="position:absolute; left:-9999px; top:-9999px;"></textarea>
-      <button type="button" id="fullPromptBtn" onclick="copyFullPrompt()">
-        &#128203; Copier le prompt complet pour une IA
-      </button>
-      <p class="sub" style="margin:10px 0 0 0; font-size:0.8rem;">
-        {len(session.story_log)} chapitre(s) enregistre(s) dans le journal.
-      </p>
-    </div>
+    {render_continue_card_html()}
 
     <div class="card">
       <h2 style="margin-top:0">Dernier lancer</h2>
@@ -1432,10 +1629,90 @@ def do_clear_mistral_key():
     return render_ai_panel_html()
 
 
+@app.route("/totem_images/<path:filename>")
+def totem_image(filename):
+    """Sert les images de totems ajoutees par le joueur, sauvegardees en
+    local sur l'appareil (jamais envoyees ailleurs)."""
+    return send_from_directory(TOTEM_IMAGES_DIR, filename)
+
+
+def _save_totem_image(file_storage):
+    """Sauvegarde une image de totem uploadee, avec un nom de fichier
+    genere (pour eviter toute collision), et renvoie ce nom de fichier
+    (ou None si aucun fichier valide n'a ete fourni)."""
+    if not file_storage or not file_storage.filename:
+        return None
+    ext = ""
+    if "." in file_storage.filename:
+        ext = file_storage.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ALLOWED_TOTEM_IMAGE_EXTS:
+        ext = "png"
+    os.makedirs(TOTEM_IMAGES_DIR, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    file_storage.save(os.path.join(TOTEM_IMAGES_DIR, filename))
+    return filename
+
+
+@app.route("/add_custom_totem", methods=["POST"])
+def do_add_custom_totem():
+    """Ajoute un nouveau totem en cours de partie : nom, pouvoirs,
+    capacite speciale optionnelle, et soit un emoji soit une image
+    fournie par le joueur (l'image prend le pas sur l'emoji si les deux
+    sont donnes)."""
+    label = request.form.get("label", "")
+    powers = request.form.get("powers", "")
+    special = request.form.get("special", "")
+    emoji = request.form.get("emoji", "")
+    image_filename = _save_totem_image(request.files.get("image"))
+    session.add_custom_totem(label, powers_text=powers, special=special,
+                              emoji=emoji, image_filename=image_filename)
+    return jsonify({
+        "gauges": render_totem_gauges_html(),
+        "symbol_picker": render_symbol_picker_html(),
+    })
+
+
+@app.route("/remove_custom_totem", methods=["POST"])
+def do_remove_custom_totem():
+    """Retire un totem ajoute par le joueur (jauge et image comprises)."""
+    key = request.form.get("key", "")
+    entry = next((t for t in session.custom_totems if t["key"] == key), None)
+    removed = session.remove_custom_totem(key)
+    if removed and entry and entry.get("image"):
+        try:
+            os.remove(os.path.join(TOTEM_IMAGES_DIR, entry["image"]))
+        except OSError:
+            pass
+    return jsonify({
+        "gauges": render_totem_gauges_html(),
+        "symbol_picker": render_symbol_picker_html(),
+    })
+
+
 @app.route("/reset_ai_conversation", methods=["POST"])
 def do_reset_ai_conversation():
     session.reset_ai_conversation()
     return render_ai_panel_html()
+
+
+@app.route("/send_full_prompt", methods=["POST"])
+def do_send_full_prompt():
+    """Bouton "Envoyer le prompt a l'IA" : transmet mecaniques + histoire
+    deja vecue, avec une instruction de demarrer/poursuivre le chapitre.
+    Permet d'amorcer la conversation automatique sans attendre un lancer."""
+    _, ai_error = run_ai_narrator(build_ai_kickoff_message())
+    return jsonify({"ai_story": render_ai_panel_html(ai_error)})
+
+
+@app.route("/send_ai_message", methods=["POST"])
+def do_send_ai_message():
+    """Message libre envoye a l'IA a tout moment (demarrer l'aventure,
+    decrire une action de Gabin entre deux lancers...)."""
+    text = (request.form.get("text") or "").strip()
+    ai_error = None
+    if text:
+        _, ai_error = run_ai_narrator(text)
+    return jsonify({"ai_story": render_ai_panel_html(ai_error)})
 
 
 @app.route("/roll", methods=["POST"])
